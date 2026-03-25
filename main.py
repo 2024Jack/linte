@@ -1,7 +1,10 @@
-# main.py
 import os
 from datetime import datetime
 from typing import List, Optional
+import socket
+import subprocess
+import re
+import time
 
 
 # 1. 先加载环境变量 (最重要！必须在导入其他自定义模块前做)
@@ -22,18 +25,18 @@ try:
 
     # 初始化数据库表
     Base.metadata.create_all(bind=engine)
-    print("✅ 数据库初始化成功")
+    print("数据库初始化成功")
 except Exception as e:
-    print(f"❌ 数据库初始化失败: {e}")
+    print(f"[ERROR] 数据库初始化失败: {e}")
     raise e
 
 # 4. 导入认证引擎
 try:
     from auth_engine import AuthEngine
 
-    print("✅ 认证引擎导入成功")
+    print("认证引擎导入成功")
 except Exception as e:
-    print(f"❌ 认证引擎导入失败: {e}")
+    print(f"[ERROR] 认证引擎导入失败: {e}")
     raise e
 
 # 5. 尝试导入匹配引擎 (允许失败，不影响核心功能)
@@ -41,18 +44,24 @@ match_engine = None
 try:
     from match import MatcherEngine
 
-    model_path = r"D:\MatchModule\server\models\bge-large-zh-v1.5"
+    # 模型下载到当前项目目录下的 `model/bge-large-zh-v1.5`
+    # 用相对路径避免写死盘符（比如 D:\）
+    model_path = os.path.join(
+        os.path.dirname(__file__),
+        "model",
+        "bge-large-zh-v1.5",
+    )
 
     if os.path.exists(model_path):
-        print(f"🚀 正在加载大模型... (这可能需要几十秒)")
+        print("正在加载大模型...（可能需要几十秒）")
         match_engine = MatcherEngine(model_path=model_path)
-        print("✅ 匹配引擎加载成功")
+        print("匹配引擎加载成功")
     else:
-        print(f"⚠️ 警告：未找到模型文件夹 '{model_path}'")
-        print("👉 匹配功能将不可用，但注册/登录/日程功能正常。")
+        print(f"[WARN] 未找到模型文件夹 '{model_path}'")
+        print("匹配功能将不可用，但注册/登录/日程功能正常。")
 except Exception as e:
-    print(f"⚠️ 匹配引擎加载异常: {e}")
-    print("👉 服务器将继续运行，仅匹配接口不可用。")
+    print(f"[WARN] 匹配引擎加载异常: {e}")
+    print("服务器将继续运行，仅匹配接口不可用。")
 
 # ================= 创建 App =================
 app = FastAPI(title="日程匹配与认证系统")
@@ -190,7 +199,64 @@ def run_match(req: MatchRequest):
 
 
 if __name__ == "__main__":
-    print("🚀 服务器正在启动...")
-    print("📍 本地访问: http://127.0.0.1:8000")
-    print("📍 文档地址: http://127.0.0.1:8000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    def _port_available(p: int) -> bool:
+        # 通过“尝试绑定”判断端口是否可用（立即释放 socket）
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                # 不使用 SO_REUSEADDR，避免“误判端口已被占用但仍能 bind”的情况
+                s.bind(("0.0.0.0", p))
+                return True
+            except OSError:
+                return False
+
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+
+    def _kill_process_on_port(p: int) -> None:
+        # 仅用于开发环境：尝试查找并终止监听该端口的进程
+        try:
+            output = subprocess.check_output(
+                ["netstat", "-ano"],
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except Exception:
+            return
+
+        for line in output.splitlines():
+            if f":{p}" not in line:
+                continue
+            if "LISTENING" not in line.upper():
+                continue
+            m = re.search(r"\s(\d+)\s*$", line)
+            if not m:
+                continue
+            pid = m.group(1)
+            try:
+                subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+                time.sleep(0.6)
+            except Exception:
+                pass
+
+    host = "0.0.0.0"
+    port = int(os.getenv("PORT", "8000"))
+
+    print("服务器正在启动...")
+
+    # 尝试自动释放端口（避免反复报 winerror 10048）
+    for _ in range(3):
+        if _port_available(port):
+            break
+        print(f"[WARN] 端口 {port} 已被占用，尝试自动结束占用进程...")
+        _kill_process_on_port(port)
+        time.sleep(1)
+    else:
+        port = _find_free_port()
+        print(f"[WARN] 自动释放失败，改用端口 {port}")
+
+    print(f"本地访问: http://127.0.0.1:{port}")
+    print(f"文档地址: http://127.0.0.1:{port}/docs")
+    uvicorn.run(app, host=host, port=port)
